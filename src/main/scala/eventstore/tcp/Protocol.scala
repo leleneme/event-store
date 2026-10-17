@@ -41,6 +41,8 @@ object Protocol:
     case Fetch(eventId: String, streamId: Option[String])
     case Read(streamId: String, from: Long, to: Option[Long])
     case ReadByType(eventType: String)
+    case Listen(streamId: String, from: Long)
+    case ListenByType(eventType: String)
 
   private def failure(cursor: HCursor, message: String): DecodingFailure =
     DecodingFailure(message, cursor.history)
@@ -99,6 +101,13 @@ object Protocol:
         yield Request.Read(streamId, from.getOrElse(0L), to)
       case "readByType" =>
         cursor.get[String]("eventType").map(Request.ReadByType.apply)
+      case "listen" =>
+        for
+          streamId <- cursor.get[String]("streamId")
+          from <- cursor.get[Option[Long]]("fromRevision")
+        yield Request.Listen(streamId, from.getOrElse(0L))
+      case "listenByType" =>
+        cursor.get[String]("eventType").map(Request.ListenByType.apply)
       case other => Left(failure(cursor, s"Unknown operation: $other"))
     }
   }
@@ -126,58 +135,97 @@ object Protocol:
     )
   )
 
-  /** Each request produces event frames followed by done, or one terminal
-    * error.
+  final case class Response[F[_]](frames: Stream[F, Json], listening: Boolean)
+
+  private val subscribed: Json =
+    Json.obj("type" -> Json.fromString("subscribed"))
+
+  private def finite[F[_]](events: Stream[F, StoredEvent]): Stream[F, Json] =
+    events.map(eventJson) ++ Stream.emit(
+      Json.obj("type" -> Json.fromString("done"))
+    )
+
+  /** Finite operations end in done; listeners stay open until cancelled or
+    * failed.
     */
-  def responses[F[_]: MonadThrow](
+  def response[F[_]: MonadThrow](
       store: EventStore[F],
       body: Chunk[Byte]
-  ): Stream[F, Json] =
+  ): Response[F] =
     decode[Request](new String(body.toArray, UTF_8)) match
       case Left(problem) =>
-        Stream.emit(error("invalid_request", problem.getMessage))
+        Response(
+          Stream.emit(error("invalid_request", problem.getMessage)),
+          false
+        )
       case Right(request) =>
-        val events = request match
+        val listening = request match
+          case Request.Listen(_, _) | Request.ListenByType(_) => true
+          case _                                              => false
+        val frames = request match
           case Request.Append(id, batch, revision) =>
             val validated = for
               streamId <- StreamId.from(id)
               domainEvents <- batch.traverse(_.toDomain)
               expected <- revision.toDomain
             yield (streamId, domainEvents, expected)
-            Stream
-              .eval(MonadThrow[F].fromEither(validated).flatMap {
-                case (streamId, domainEvents, expected) =>
-                  store.append(streamId, domainEvents, expected)
-              })
-              .flatMap(es => Stream.emits(es.toList))
+            finite(
+              Stream
+                .eval(MonadThrow[F].fromEither(validated).flatMap {
+                  case (streamId, domainEvents, expected) =>
+                    store.append(streamId, domainEvents, expected)
+                })
+                .flatMap(es => Stream.emits(es.toList))
+            )
           case Request.Fetch(id, streamId) =>
             val validated = for
               eventId <- EventId.from(id)
               owner <- streamId.traverse(StreamId.from)
             yield (eventId, owner)
-            Stream
-              .eval(MonadThrow[F].fromEither(validated).flatMap {
-                case (eventId, owner) =>
-                  owner.fold(store.fetch(eventId))(store.fetch(_, eventId))
-              })
-              .flatMap(e => Stream.emits(e.toList))
+            finite(
+              Stream
+                .eval(MonadThrow[F].fromEither(validated).flatMap {
+                  case (eventId, owner) =>
+                    owner.fold(store.fetch(eventId))(store.fetch(_, eventId))
+                })
+                .flatMap(e => Stream.emits(e.toList))
+            )
           case Request.Read(id, from, to) =>
             val validated = for
               streamId <- StreamId.from(id)
               first <- Revision.from(from)
               last <- to.traverse(Revision.from)
             yield (streamId, first, last)
-            Stream.eval(MonadThrow[F].fromEither(validated)).flatMap {
+            finite(Stream.eval(MonadThrow[F].fromEither(validated)).flatMap {
               case (streamId, first, last) => store.read(streamId, first, last)
-            }
+            })
           case Request.ReadByType(kind) =>
+            finite(
+              Stream
+                .eval(MonadThrow[F].fromEither(EventType.from(kind)))
+                .flatMap(store.readByType)
+            )
+          case Request.Listen(id, from) =>
+            val validated = for
+              streamId <- StreamId.from(id)
+              first <- Revision.from(from)
+            yield (streamId, first)
+            Stream.eval(MonadThrow[F].fromEither(validated)).flatMap {
+              case (streamId, first) =>
+                Stream.emit(subscribed) ++ store
+                  .listen(streamId, first)
+                  .map(eventJson)
+            }
+          case Request.ListenByType(kind) =>
             Stream
               .eval(MonadThrow[F].fromEither(EventType.from(kind)))
-              .flatMap(store.readByType)
-        (events.map(eventJson) ++ Stream.emit(
-          Json.obj("type" -> Json.fromString("done"))
-        ))
-          .handleErrorWith {
+              .flatMap { eventType =>
+                Stream.emit(subscribed) ++ store
+                  .listenByType(eventType)
+                  .map(eventJson)
+              }
+        Response(
+          frames.handleErrorWith {
             case e: StoreError =>
               val code = e match
                 case _: StoreError.InvalidArgument  => "invalid_argument"
@@ -185,4 +233,6 @@ object Protocol:
                 case _: StoreError.RevisionConflict => "revision_conflict"
               Stream.emit(error(code, e.getMessage))
             case other => Stream.raiseError[F](other)
-          }
+          },
+          listening
+        )

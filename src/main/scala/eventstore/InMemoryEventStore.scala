@@ -2,21 +2,23 @@ package eventstore
 
 import cats.MonadThrow
 import cats.data.NonEmptyList
-import cats.effect.{Ref, Sync}
+import cats.effect.Async
 import cats.effect.std.{SecureRandom, UUIDGen}
 import cats.syntax.all.*
 import fs2.Stream
+import fs2.concurrent.SignallingRef
 
 object InMemoryEventStore:
-  // Allocating the secure random source requires Sync; operating the store does not.
-  def create[F[_]: Sync]: F[EventStore[F]] =
+  // Allocation needs synchronous randomness and concurrent change notifications.
+  def create[F[_]: Async]: F[EventStore[F]] =
     SecureRandom.of[F].flatMap { random =>
       given SecureRandom[F] = random
-      Ref.of[F, StoreState](StoreState()).map(new Impl[F](_))
+      SignallingRef[F, StoreState](StoreState()).map(new Impl[F](_))
     }
 
-  private final class Impl[F[_]: MonadThrow: UUIDGen](state: Ref[F, StoreState])
-      extends EventStore[F]:
+  private final class Impl[F[_]: MonadThrow: UUIDGen](
+      state: SignallingRef[F, StoreState]
+  ) extends EventStore[F]:
     def append(
         streamId: StreamId,
         events: NonEmptyList[NewEvent],
@@ -69,3 +71,27 @@ object InMemoryEventStore:
       Stream
         .eval(state.get)
         .flatMap(snapshot => snapshot.readByType(eventType).covary[F])
+
+    private def follow(
+        select: StoreState => Vector[EventPosition],
+        from: Long
+    ): Stream[F, StoredEvent] =
+      // discrete may coalesce updates. Indices retain every committed event, so
+      // the cursor catches up from each observed state without depending on notifications.
+      state.discrete
+        .mapAccumulate(from) { (cursor, snapshot) =>
+          val positions = select(snapshot)
+          val end = positions.size.toLong
+          val start = cursor.min(end).toInt
+          (cursor.max(end), snapshot.resolve(positions, start, positions.size))
+        }
+        .flatMap { case (_, events) => events.covary[F] }
+
+    def listen(
+        streamId: StreamId,
+        fromRevision: Revision
+    ): Stream[F, StoredEvent] =
+      follow(_.streams.getOrElse(streamId, Vector.empty), fromRevision.value)
+
+    def listenByType(eventType: EventType): Stream[F, StoredEvent] =
+      follow(_.eventTypes.getOrElse(eventType, Vector.empty), 0L)

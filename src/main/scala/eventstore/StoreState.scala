@@ -3,7 +3,8 @@ package eventstore
 import cats.data.NonEmptyList
 import fs2.{Chunk, Pull, Pure, Stream}
 
-/** Immutable event array and its indices, committed together in a single Ref.
+/** Immutable event array and its indices, committed together in a single
+  * SignallingRef.
   */
 private[eventstore] final case class StoreState(
     events: Vector[StoredEvent] = Vector.empty,
@@ -19,7 +20,7 @@ private[eventstore] final case class StoreState(
   def fetch(eventId: EventId): Option[StoredEvent] =
     eventIds.get(eventId).map(at)
 
-  private def resolve(
+  private[eventstore] def resolve(
       positions: Vector[EventPosition],
       start: Int,
       end: Int

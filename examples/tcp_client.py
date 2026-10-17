@@ -40,12 +40,19 @@ def main():
     parser.add_argument("requests", nargs="+", help="JSON requests, executed sequentially")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=5252)
+    parser.add_argument("--timeout", type=float, default=10,
+                        help="socket timeout in seconds; 0 waits indefinitely for subscriptions")
     args = parser.parse_args()
-    with socket.create_connection((args.host, args.port), timeout=10) as connection:
+    if args.timeout < 0:
+        parser.error("--timeout must be nonnegative")
+    with socket.create_connection((args.host, args.port), timeout=args.timeout or None) as connection:
         for request in args.requests:
             for frame in responses(connection, json.loads(request)):
                 print(json.dumps(frame, ensure_ascii=False), flush=True)
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        pass

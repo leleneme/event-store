@@ -18,10 +18,16 @@ class TcpServerSuite extends CatsEffectSuite:
   override val munitIOTimeout = 15.seconds
 
   private def running(
-      store: EventStore[IO]
+      store: EventStore[IO],
+      maxConnections: Int = 64
   ): Resource[IO, TcpServer.Bound[IO]] =
     TcpServer
-      .bind[IO](store, SocketAddress(ip"127.0.0.1", port"0"), _ => IO.unit)
+      .bind[IO](
+        store,
+        SocketAddress(ip"127.0.0.1", port"0"),
+        _ => IO.unit,
+        maxConnections
+      )
       .flatMap(server => server.run.background.as(server))
 
   private def connect(server: TcpServer.Bound[IO]): Resource[IO, Socket[IO]] =
@@ -227,6 +233,8 @@ class TcpServerSuite extends CatsEffectSuite:
         def fetch(s: StreamId, e: EventId) = store.fetch(s, e)
         def fetch(e: EventId) = store.fetch(e)
         def readByType(t: EventType) = store.readByType(t)
+        def listen(s: StreamId, from: Revision) = store.listen(s, from)
+        def listenByType(t: EventType) = store.listenByType(t)
         def read(
             s: StreamId,
             from: Revision,
@@ -260,6 +268,104 @@ class TcpServerSuite extends CatsEffectSuite:
             connect(server).use { socket =>
               send(socket, """{"op":"readByType","eventType":"T"}""") *>
                 receive(socket).map(frame => assertEquals(kind(frame), "done"))
+            }
+          }
+        }
+      }
+    }
+  }
+
+  test(
+    "TCP listeners replay history then receive live events by stream and type"
+  ) {
+    InMemoryEventStore.create[IO].flatMap { store =>
+      running(store).use { server =>
+        (connect(server), connect(server), connect(server)).tupled.use {
+          case (streamListener, typeListener, writer) =>
+            for
+              _ <- send(writer, append)
+              _ <- response(writer)
+              _ <- send(
+                streamListener,
+                """{"op":"listen","streamId":"orders","fromRevision":1}"""
+              )
+              readyStream <- receive(streamListener)
+              replayStream <- receive(streamListener)
+              _ <- send(
+                typeListener,
+                """{"op":"listenByType","eventType":"Placed"}"""
+              )
+              readyType <- receive(typeListener)
+              replayType <- receive(typeListener)
+              _ <- send(
+                writer,
+                """{"op":"append","streamId":"other","events":[{"eventId":"c","eventType":"Placed","payloadBase64":""}]}"""
+              )
+              _ <- response(writer)
+              _ <- send(
+                writer,
+                """{"op":"append","streamId":"orders","events":[{"eventId":"d","eventType":"Paid","payloadBase64":""}]}"""
+              )
+              _ <- response(writer)
+              liveStream <- receive(streamListener)
+              liveType <- receive(typeListener)
+            yield
+              assertEquals(kind(readyStream), "subscribed")
+              assertEquals(kind(readyType), "subscribed")
+              assertEquals(id(replayStream), "b")
+              assertEquals(id(replayType), "a")
+              assertEquals(id(liveStream), "d")
+              assertEquals(id(liveType), "c")
+        }
+      }
+    }
+  }
+
+  test("disconnecting an idle subscription releases its connection slot") {
+    InMemoryEventStore.create[IO].flatMap { store =>
+      running(store, maxConnections = 1).use { server =>
+        connect(server).use { socket =>
+          send(socket, """{"op":"listen","streamId":"not-created-yet"}""") *>
+            receive(socket)
+              .map(frame => assertEquals(kind(frame), "subscribed"))
+        } *> connect(server).use { socket =>
+          send(socket, """{"op":"readByType","eventType":"T"}""") *>
+            receive(socket).map(frame => assertEquals(kind(frame), "done"))
+        }
+      }
+    }
+  }
+
+  test(
+    "subscriptions reject further commands and invalid subscription arguments"
+  ) {
+    InMemoryEventStore.create[IO].flatMap { store =>
+      running(store).use { server =>
+        connect(server).use { socket =>
+          for
+            _ <- send(socket, """{"op":"listenByType","eventType":"T"}""")
+            ready <- receive(socket)
+            _ <- send(socket, """{"op":"readByType","eventType":"T"}""")
+            error <- receive(socket)
+            eof <- Framing.read(socket)
+          yield
+            assertEquals(kind(ready), "subscribed")
+            assertEquals(
+              error.hcursor.get[String]("code"),
+              Right("invalid_request")
+            )
+            assertEquals(eof, None)
+        } *> List(
+          """{"op":"listen","streamId":"s","fromRevision":-1}""",
+          """{"op":"listen","streamId":" "}""",
+          """{"op":"listenByType","eventType":" "}"""
+        ).traverse_ { request =>
+          connect(server).use { socket =>
+            send(socket, request) *> receive(socket).map { frame =>
+              assertEquals(
+                frame.hcursor.get[String]("code"),
+                Right("invalid_argument")
+              )
             }
           }
         }

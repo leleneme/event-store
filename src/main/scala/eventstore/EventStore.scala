@@ -27,3 +27,13 @@ trait EventStore[F[_]]:
       fromRevision: Revision = Revision.Zero,
       toRevision: Option[Revision] = None
   ): Stream[F, StoredEvent]
+
+  /** Replay from the given revision, then follow future events until cancelled.
+    */
+  def listen(
+      streamId: StreamId,
+      fromRevision: Revision = Revision.Zero
+  ): Stream[F, StoredEvent]
+
+  /** Replay all matching events in global order, then follow future appends. */
+  def listenByType(eventType: EventType): Stream[F, StoredEvent]
