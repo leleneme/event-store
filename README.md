@@ -4,13 +4,33 @@ A small and simple in-memory event store experiment using Scala 3, Cats Effect, 
 
 `EventStore[F]` is a transport-independent API. `InMemoryEventStore` implements it using an FS2 `SignallingRef`, which provides atomic state updates and change notifications. The TCP adapter decodes requests, calls this API, and streams responses using FS2 and Circe.
 
-## Run
+## Requirements
+
+- Java 17 or greater
+- Scala 3.10.0 (pinned in build.sbt)
+- sbt 2.0.12 (pinned in build.properties)
+
+## Run from source
 
 ```sh
-sbt test
+sbt test # optional: run test suite
 sbt run
 sbt 'run --host 0.0.0.0 --port 6000'
 sbt 'run --help'
+```
+
+## Build and run the server JAR
+
+Build a standalone JAR:
+
+```sh
+sbt assembly
+```
+
+Running:
+
+```sh
+java -jar target/sc-event-store.jar
 ```
 
 ## API

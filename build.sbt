@@ -7,6 +7,14 @@ lazy val root = project
     version := "0.1.0-SNAPSHOT",
 
     scalaVersion := scala3Version,
+    scalacOptions += "-release:17",
+    javacOptions ++= Seq("--release", "17"),
+
+    Compile / mainClass := Some("Main"),
+    assembly / mainClass := Some("Main"),
+    assembly / assemblyJarName := "sc-event-store.jar",
+    assembly / assemblyOutputPath := baseDirectory.value / "target" / "sc-event-store.jar",
+    assembly / test := (Test / test).toTask("").value,
 
     libraryDependencies ++= Seq(
       "org.typelevel" %% "cats-effect" % "3.7.1",
