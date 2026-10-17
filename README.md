@@ -8,8 +8,9 @@ A small and simple in-memory event store experiment using Scala 3, Cats Effect, 
 
 ```sh
 sbt test
-sbt 'runMain Main'
-sbt 'runMain eventstore.tcp.ServerMain'
+sbt run
+sbt 'run --host 0.0.0.0 --port 6000'
+sbt 'run --help'
 ```
 
 ## API
@@ -49,7 +50,7 @@ Listeners end when cancelled. Each listener tracks its own index cursor. Change 
 
 ## TCP interface
 
-Run `sbt 'runMain eventstore.tcp.ServerMain'` to listen on `127.0.0.1:5252`.
+Run `sbt run` to listen on `127.0.0.1:5252`.
 
 Each message is a four-byte big-endian length followed by UTF-8 encoded JSON payload. Request bodies must be between 1 byte and 1 MiB. Payload bytes use standard Base64 in `payloadBase64` since events can store any byte blob; IDs and types are JSON strings.
 

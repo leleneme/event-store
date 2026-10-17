@@ -1,36 +1,32 @@
-import cats.data.NonEmptyList
-import cats.effect.{IO, IOApp}
-import eventstore.*
-import fs2.Chunk
+import cats.effect.{ExitCode, IO, IOApp}
+import cats.effect.std.Console
+import eventstore.InMemoryEventStore
+import eventstore.tcp.{ServerConfig, TcpServer}
 
-object Main extends IOApp.Simple:
-  def run: IO[Unit] =
-    val streamId = StreamId.unsafeFrom("order-123")
-    for
-      store <- InMemoryEventStore.create[IO]
-      appended <- store.append(
-        streamId,
-        NonEmptyList.of(
-          NewEvent(
-            Chunk.from("OrderPlaced".getBytes("UTF-8")),
-            EventType.unsafeFrom("OrderPlaced")
-          ),
-          NewEvent(
-            Chunk.from("OrderPaid".getBytes("UTF-8")),
-            EventType.unsafeFrom("OrderPaid")
-          )
-        ),
-        ExpectedRevision.NoStream
-      )
-      _ <- IO.println(
-        s"Appended ${appended.length} events to ${streamId.value}"
-      )
-      _ <- store.read(streamId).evalMap(IO.println).compile.drain
-      _ <- store
-        .readByType(EventType.unsafeFrom("OrderPaid"))
-        .evalMap(IO.println)
-        .compile
-        .drain
-      found <- store.fetch(streamId, appended.head.eventId)
-      _ <- IO.println(s"Fetched: $found")
-    yield ()
+object Main extends IOApp:
+  def run(args: List[String]): IO[ExitCode] =
+    ServerConfig.parse(args) match
+      case Left(error) =>
+        Console[IO]
+          .errorln(s"$error\n\n${ServerConfig.usage}")
+          .as(ExitCode.Error)
+      case Right(None) => IO.println(ServerConfig.usage).as(ExitCode.Success)
+      case Right(Some(config)) =>
+        InMemoryEventStore
+          .create[IO]
+          .flatMap { store =>
+            TcpServer
+              .bind[IO](
+                store,
+                config.address,
+                error =>
+                  Console[IO]
+                    .errorln(s"TCP connection failed: ${error.getMessage}")
+              )
+              .use { server =>
+                IO.println(
+                  s"Event store listening on ${server.address}"
+                ) *> server.run
+              }
+          }
+          .as(ExitCode.Success)
